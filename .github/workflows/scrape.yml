@@ -5,6 +5,10 @@ on:
     - cron: '0 */6 * * *'   # toutes les 6h
   workflow_dispatch:          # lancement manuel aussi
 
+concurrency:
+  group: scraper-agences
+  cancel-in-progress: false   # le nouveau run ATTEND la fin du précédent, ne l'interrompt pas
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
@@ -29,8 +33,7 @@ jobs:
           GOOGLE_OAUTH_REFRESH_TOKEN: ${{ secrets.GOOGLE_OAUTH_REFRESH_TOKEN }}
           GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
         run: python scraper_agences_enrichi_drive.py
-        
-        
+
       - name: Commit progress + résultats
         if: always()
         run: |
@@ -38,4 +41,6 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add progress_scraper.json agences_scrappees.csv agences_echecs.csv || true
           git diff --staged --quiet || git commit -m "scraper: progression $(date +'%Y-%m-%d %H:%M')"
+          git pull --rebase --autostash
           git push
+          
