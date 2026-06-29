@@ -1,18 +1,53 @@
 """
 scraper_agences_enrichi.py
-Version GitHub Actions — pas de sauvegarde HTML sur disque (espace limité)
+Version GitHub Actions + sauvegarde Google Drive (par lots zippés)
 Lit : agences_independantes.csv
 Écrit : agences_scrappees.csv, agences_echecs.csv, progress_scraper.json
+Upload : un zip de HTML toutes les SAVE_EVERY agences, vers un dossier Drive
+
+──────────────────────────────────────────────────────────────────────────────
+CONFIG NÉCESSAIRE (secrets GitHub Actions) :
+
+1. GOOGLE_SERVICE_ACCOUNT_JSON
+   → Contenu brut (JSON) de la clé d'un compte de service Google Cloud
+     qui a accès en écriture au dossier Drive cible.
+   → Crée le compte de service dans Google Cloud Console (IAM & Admin >
+     Comptes de service), génère une clé JSON, et PARTAGE ton dossier
+     Drive avec l'adresse e-mail du compte de service (en "Éditeur").
+
+2. GDRIVE_FOLDER_ID
+   → L'ID du dossier Drive cible (visible dans l'URL du dossier :
+     https://drive.google.com/drive/folders/<CET_ID>)
+
+Dans ton workflow .yml, ajoute ces deux secrets en variables d'env :
+
+    env:
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+      GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+
+Et installe les dépendances Drive dans requirements.txt :
+    google-api-python-client
+    google-auth
+──────────────────────────────────────────────────────────────────────────────
 """
 
 import csv
+import io
+import json
 import os
 import re
+import shutil
 import time
-import json
-import requests
-from urllib.parse import urlparse
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+from urllib.parse import urlparse
+
+import requests
+
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 
@@ -21,10 +56,14 @@ PROGRESS_FILE = "progress_scraper.json"
 PATH_OK       = "agences_scrappees.csv"
 PATH_ECHECS   = "agences_echecs.csv"
 
+LOCAL_HTML_DIR = "html_pages_tmp"   # vidé après chaque upload
+
 THREADS_PAR_SITE  = 10
 DELAY_ENTRE_SITES = 0.3
 TIMEOUT           = 8
-SAVE_EVERY        = 50
+SAVE_EVERY        = 50              # taille d'un lot avant zip + upload Drive
+
+GDRIVE_FOLDER_ID = os.environ.get("GDRIVE_FOLDER_ID")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -77,24 +116,113 @@ FIELDNAMES_IN = [
 
 FIELDNAMES_OUT = FIELDNAMES_IN + ["pages_trouvees", "nb_pages", "equipe_info", "responsable_info", "nombre_annonces"]
 
+# ─── GOOGLE DRIVE ─────────────────────────────────────────────────────────────
+
+def get_drive_service():
+    """Construit le client Drive à partir du compte de service (variable d'env)."""
+    raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if not raw:
+        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON manquant dans l'environnement.")
+    if not GDRIVE_FOLDER_ID:
+        raise RuntimeError("GDRIVE_FOLDER_ID manquant dans l'environnement.")
+
+    info = json.loads(raw)
+    creds = service_account.Credentials.from_service_account_info(
+        info, scopes=["https://www.googleapis.com/auth/drive.file"]
+    )
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+def zipper_dossier(dossier: str, nom_zip: str) -> str | None:
+    """Zippe le contenu de `dossier` vers `nom_zip`. Retourne le chemin, ou None si vide."""
+    if not os.path.isdir(dossier) or not os.listdir(dossier):
+        return None
+    with zipfile.ZipFile(nom_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+        for root, _, files in os.walk(dossier):
+            for fname in files:
+                full_path = os.path.join(root, fname)
+                arcname = os.path.relpath(full_path, dossier)
+                zf.write(full_path, arcname)
+    return nom_zip
+
+
+def upload_zip_drive(service, chemin_zip: str):
+    """Upload un fichier zip vers le dossier Drive cible."""
+    nom_fichier = os.path.basename(chemin_zip)
+    file_metadata = {"name": nom_fichier, "parents": [GDRIVE_FOLDER_ID]}
+    with open(chemin_zip, "rb") as f:
+        media = MediaIoBaseUpload(io.BytesIO(f.read()), mimetype="application/zip", resumable=True)
+    service.files().create(body=file_metadata, media_body=media, fields="id").execute()
+
+
+def flush_batch_vers_drive(service, batch_num: int):
+    """Zippe LOCAL_HTML_DIR, upload sur Drive, puis vide le dossier local."""
+    if not os.path.isdir(LOCAL_HTML_DIR) or not os.listdir(LOCAL_HTML_DIR):
+        return
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    nom_zip = f"pages_html_batch{batch_num:05d}_{timestamp}.zip"
+
+    chemin = zipper_dossier(LOCAL_HTML_DIR, nom_zip)
+    if not chemin:
+        return
+
+    print(f"\n☁️  Upload {nom_zip} vers Drive...", end=" ", flush=True)
+    try:
+        upload_zip_drive(service, chemin)
+        print("✅")
+    except Exception as e:
+        print(f"❌ échec upload Drive : {e}")
+        # on garde le zip localement si l'upload a échoué, au cas où
+        return
+    finally:
+        os.remove(chemin)
+
+    # on vide le dossier local seulement si l'upload a réussi
+    shutil.rmtree(LOCAL_HTML_DIR, ignore_errors=True)
+    os.makedirs(LOCAL_HTML_DIR, exist_ok=True)
+
+
+def sauver_pages_localement(identifiant_site: str, pages: dict):
+    """Écrit les HTML d'un site sur disque, dans LOCAL_HTML_DIR/<identifiant>/<slug>.html"""
+    dossier_site = os.path.join(LOCAL_HTML_DIR, sanitize_filename(identifiant_site))
+    os.makedirs(dossier_site, exist_ok=True)
+    for slug, html_content in pages.items():
+        nom_slug = slug if slug else "index"
+        nom_slug = sanitize_filename(nom_slug)
+        chemin = os.path.join(dossier_site, f"{nom_slug}.html")
+        with open(chemin, "w", encoding="utf-8") as f:
+            f.write(html_content)
+
+
+def sanitize_filename(s: str) -> str:
+    s = s.strip("/")
+    return re.sub(r"[^a-zA-Z0-9_.-]", "_", s) or "page"
+
 # ─── PROGRESS ─────────────────────────────────────────────────────────────────
 
 def charger_progress():
     if os.path.exists(PROGRESS_FILE):
         with open(PROGRESS_FILE, encoding="utf-8") as f:
             data = json.load(f)
-            return set(data.get("traites", [])), data.get("total_ok", 0), data.get("total_echecs", 0)
-    return set(), 0, 0
+            return (
+                set(data.get("traites", [])),
+                data.get("total_ok", 0),
+                data.get("total_echecs", 0),
+                data.get("batch_num", 0),
+            )
+    return set(), 0, 0, 0
 
-def sauver_progress(traites: set, total_ok: int, total_echecs: int):
+def sauver_progress(traites: set, total_ok: int, total_echecs: int, batch_num: int):
     with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
         json.dump({
             "traites": list(traites),
             "total_ok": total_ok,
-            "total_echecs": total_echecs
+            "total_echecs": total_echecs,
+            "batch_num": batch_num,
         }, f)
 
-# ─── UTILS ────────────────────────────────────────────────────────────────────
+# ─── UTILS SCRAPING ───────────────────────────────────────────────────────────
 
 def normaliser_url(url: str) -> str:
     url = url.strip().rstrip("/")
@@ -163,14 +291,17 @@ def scraper_site(base_url: str) -> dict:
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 def main():
-    traites, cumul_ok, cumul_echecs = charger_progress()
+    traites, cumul_ok, cumul_echecs, batch_num = charger_progress()
     reprise = len(traites) > 0
 
+    os.makedirs(LOCAL_HTML_DIR, exist_ok=True)
+    drive_service = get_drive_service()
+
     if reprise:
-        print(f"▶️  Reprise — {len(traites)} agences déjà traitées ({cumul_ok} ✅ | {cumul_echecs} ❌)")
+        print(f"▶️  Reprise — {len(traites)} agences déjà traitées ({cumul_ok} ✅ | {cumul_echecs} ❌) | batch #{batch_num}")
         print(f"   Reste environ {11000 - len(traites)} agences")
     else:
-        print("🚀 Démarrage du scraping...")
+        print("🚀 Démarrage du scraping (avec upload Drive par lots)...")
 
     mode = "a" if reprise else "w"
 
@@ -210,6 +341,10 @@ def main():
                 if pages:
                     slugs_list = "|".join(pages.keys())
 
+                    # sauvegarde locale des HTML (pour le batch Drive)
+                    identifiant = place_id or urlparse(normaliser_url(web_site)).netloc
+                    sauver_pages_localement(identifiant, pages)
+
                     all_info = {"equipe_info": "", "responsable_info": "", "nombre_annonces": ""}
                     for slug, html_content in pages.items():
                         extracted = extract_info_from_html(html_content)
@@ -232,10 +367,12 @@ def main():
                     traites.add(place_id)
 
                 if total % SAVE_EVERY == 0:
-                    sauver_progress(traites, ok, echecs)
+                    batch_num += 1
+                    flush_batch_vers_drive(drive_service, batch_num)
+                    sauver_progress(traites, ok, echecs, batch_num)
                     f_ok.flush()
                     f_echecs.flush()
-                    print(f"\n💾 [{total}] Cumul: {len(traites)} traitées | ✅ {ok} | ❌ {echecs}\n")
+                    print(f"💾 [{total}] Cumul: {len(traites)} traitées | ✅ {ok} | ❌ {echecs}\n")
 
                 time.sleep(DELAY_ENTRE_SITES)
 
@@ -243,7 +380,10 @@ def main():
         print(f"\n⚠️  Erreur : {e}")
 
     finally:
-        sauver_progress(traites, ok, echecs)
+        # upload final du reliquat (même si < SAVE_EVERY)
+        batch_num += 1
+        flush_batch_vers_drive(drive_service, batch_num)
+        sauver_progress(traites, ok, echecs, batch_num)
         f_ok.close()
         f_echecs.close()
 
