@@ -20,10 +20,13 @@ jobs:
           python-version: '3.11'
 
       - name: Installer dépendances
-        run: pip install requests
+        run: pip install requests google-api-python-client google-auth
 
       - name: Lancer le scraper
-        run: python scraper_agences_enrichi.py
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+        run: python scraper_agences_enrichi_drive.py
 
       - name: Commit progress + résultats
         run: |
