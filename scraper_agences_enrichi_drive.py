@@ -6,28 +6,24 @@ Lit : agences_independantes.csv
 Upload : un zip de HTML toutes les SAVE_EVERY agences, vers un dossier Drive
 
 ──────────────────────────────────────────────────────────────────────────────
-CONFIG NÉCESSAIRE (secrets GitHub Actions) :
+CONFIG NÉCESSAIRE (secrets GitHub Actions) — méthode OAuth utilisateur,
+car un compte de service n'a pas de quota de stockage sur un Drive perso :
 
-1. GOOGLE_SERVICE_ACCOUNT_JSON
-   → Contenu brut (JSON) de la clé d'un compte de service Google Cloud
-     qui a accès en écriture au dossier Drive cible.
-   → Crée le compte de service dans Google Cloud Console (IAM & Admin >
-     Comptes de service), génère une clé JSON, et PARTAGE ton dossier
-     Drive avec l'adresse e-mail du compte de service (en "Éditeur").
+1. GOOGLE_OAUTH_CLIENT_ID       (Google Cloud Console > Credentials)
+2. GOOGLE_OAUTH_CLIENT_SECRET   (idem)
+3. GOOGLE_OAUTH_REFRESH_TOKEN   (généré une fois en local via get_refresh_token.py)
+4. GDRIVE_FOLDER_ID             (ID du dossier Drive cible, dans son URL)
 
-2. GDRIVE_FOLDER_ID
-   → L'ID du dossier Drive cible (visible dans l'URL du dossier :
-     https://drive.google.com/drive/folders/<CET_ID>)
-
-Dans ton workflow .yml, ajoute ces deux secrets en variables d'env :
+Dans ton workflow .yml :
 
     env:
-      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+      GOOGLE_OAUTH_CLIENT_ID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
+      GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
+      GOOGLE_OAUTH_REFRESH_TOKEN: ${{ secrets.GOOGLE_OAUTH_REFRESH_TOKEN }}
       GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
 
-Et installe les dépendances Drive dans requirements.txt :
-    google-api-python-client
-    google-auth
+Dépendances :
+    pip install requests google-api-python-client google-auth
 ──────────────────────────────────────────────────────────────────────────────
 """
 
@@ -45,7 +41,7 @@ from urllib.parse import urlparse
 
 import requests
 
-from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
@@ -114,21 +110,32 @@ FIELDNAMES_IN = [
     "place_id", "cid", "latitude", "longitude", "link"
 ]
 
-FIELDNAMES_OUT = FIELDNAMES_IN + ["pages_trouvees", "nb_pages", "equipe_info", "responsable_info", "nombre_annonces"]
+FIELDNAMES_OUT = FIELDNAMES_IN + ["pages_trouvees", "nb_pages"]
 
 # ─── GOOGLE DRIVE ─────────────────────────────────────────────────────────────
 
 def get_drive_service():
-    """Construit le client Drive à partir du compte de service (variable d'env)."""
-    raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
-    if not raw:
-        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON manquant dans l'environnement.")
+    """Construit le client Drive via OAuth utilisateur (refresh token), pas un compte de service —
+    nécessaire car les comptes de service n'ont pas de quota de stockage sur un Drive perso."""
+    client_id     = os.environ.get("GOOGLE_OAUTH_CLIENT_ID")
+    client_secret = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET")
+    refresh_token = os.environ.get("GOOGLE_OAUTH_REFRESH_TOKEN")
+
+    if not (client_id and client_secret and refresh_token):
+        raise RuntimeError(
+            "Variables OAuth manquantes : il faut GOOGLE_OAUTH_CLIENT_ID, "
+            "GOOGLE_OAUTH_CLIENT_SECRET et GOOGLE_OAUTH_REFRESH_TOKEN."
+        )
     if not GDRIVE_FOLDER_ID:
         raise RuntimeError("GDRIVE_FOLDER_ID manquant dans l'environnement.")
 
-    info = json.loads(raw)
-    creds = service_account.Credentials.from_service_account_info(
-        info, scopes=["https://www.googleapis.com/auth/drive.file"]
+    creds = Credentials(
+        token=None,
+        refresh_token=refresh_token,
+        client_id=client_id,
+        client_secret=client_secret,
+        token_uri="https://oauth2.googleapis.com/token",
+        scopes=["https://www.googleapis.com/auth/drive.file"],
     )
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
@@ -241,40 +248,6 @@ def tester_slug(args):
         pass
     return slug, None
 
-def extract_info_from_html(html_content: str) -> dict:
-    equipe_info = ""
-    responsable_info = ""
-    nombre_annonces = ""
-
-    team_patterns = [
-        r"(notre équipe|l'équipe|nos agents|nos conseillers|nos experts)\s*:\s*([\w\s,.-]+)",
-        r"(responsable|directeur|gérant)\s*:\s*([\w\s,.-]+)",
-        r"(équipe|contact|à propos|qui sommes nous)[^>]*>\s*([\w\s,.-]+(?:<br\s*\/?>[\w\s,.-]+)*)",
-    ]
-    for pattern in team_patterns:
-        match = re.search(pattern, html_content, re.IGNORECASE | re.DOTALL)
-        if match:
-            equipe_info = match.group(2).strip()
-            if any(k in match.group(1).lower() for k in ["responsable", "directeur", "gérant"]):
-                responsable_info = equipe_info
-            break
-
-    listings_patterns = [
-        r"(\d+)\s*(?:annonces|biens|propriétés|offres)\s*(?:disponibles|à vendre)?",
-        r"(\d+)\s*mandats",
-    ]
-    for pattern in listings_patterns:
-        match = re.search(pattern, html_content, re.IGNORECASE)
-        if match:
-            nombre_annonces = match.group(1)
-            break
-
-    return {
-        "equipe_info": equipe_info,
-        "responsable_info": responsable_info,
-        "nombre_annonces": nombre_annonces,
-    }
-
 def scraper_site(base_url: str) -> dict:
     base_url = normaliser_url(base_url)
     session = requests.Session()
@@ -345,17 +318,7 @@ def main():
                     identifiant = place_id or urlparse(normaliser_url(web_site)).netloc
                     sauver_pages_localement(identifiant, pages)
 
-                    all_info = {"equipe_info": "", "responsable_info": "", "nombre_annonces": ""}
-                    for slug, html_content in pages.items():
-                        extracted = extract_info_from_html(html_content)
-                        if extracted["equipe_info"] and not all_info["equipe_info"]:
-                            all_info["equipe_info"] = extracted["equipe_info"]
-                        if extracted["responsable_info"] and not all_info["responsable_info"]:
-                            all_info["responsable_info"] = extracted["responsable_info"]
-                        if extracted["nombre_annonces"] and not all_info["nombre_annonces"]:
-                            all_info["nombre_annonces"] = extracted["nombre_annonces"]
-
-                    w_ok.writerow({**row, "pages_trouvees": slugs_list, "nb_pages": len(pages), **all_info})
+                    w_ok.writerow({**row, "pages_trouvees": slugs_list, "nb_pages": len(pages)})
                     ok += 1
                     print(f"✅ {len(pages)} pages")
                 else:
