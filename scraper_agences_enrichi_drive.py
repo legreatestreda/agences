@@ -258,7 +258,9 @@ def tester_slug(args):
     session, base_url, slug = args
     url = f"{base_url}/{slug}" if slug else base_url
     try:
-        resp = session.get(url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=True)
+        # timeout = (connexion, lecture) séparés : empêche un site qui répond
+        # "au goutte-à-goutte" de contourner le timeout global de requests
+        resp = session.get(url, headers=HEADERS, timeout=(TIMEOUT, TIMEOUT), allow_redirects=True, stream=False)
         if resp.status_code == 200 and len(resp.text) > 500:
             return slug, resp.text
     except Exception:
@@ -270,12 +272,21 @@ def scraper_site(base_url: str) -> dict:
     session = requests.Session()
     args = [(session, base_url, slug) for slug in SLUGS]
     resultats = {}
+    # plafond de temps total pour TOUT le site (toutes les slugs confondues) :
+    # même si requests.timeout est contourné par un site capricieux, on abandonne
+    # ce site après TIMEOUT_TOTAL_SITE secondes, point final.
+    TIMEOUT_TOTAL_SITE = TIMEOUT * 3
     with ThreadPoolExecutor(max_workers=THREADS_PAR_SITE) as executor:
         futures = {executor.submit(tester_slug, a): a for a in args}
-        for future in as_completed(futures):
-            slug, html = future.result()
-            if html:
-                resultats[slug] = html
+        try:
+            for future in as_completed(futures, timeout=TIMEOUT_TOTAL_SITE):
+                slug, html = future.result()
+                if html:
+                    resultats[slug] = html
+        except TimeoutError:
+            # certains threads sont encore bloqués : on abandonne ce site,
+            # les threads restants mourront en arrière-plan sans bloquer la suite
+            pass
     return resultats
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
