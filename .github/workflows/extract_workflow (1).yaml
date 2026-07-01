@@ -1,0 +1,36 @@
+name: Extract and Analyze HTML from ZIP
+
+on:
+  workflow_dispatch: # Déclenchement manuel
+  push:
+    paths:
+      - '*.zip' # Se déclenche quand un ZIP est ajouté
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install beautifulsoup4 requests
+
+      - name: Run extraction and analysis
+        env:
+          FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
+        run: |
+          python extract_and_analyze.py
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: extraction-results
+          path: extraction_results.json
