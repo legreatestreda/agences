@@ -43,7 +43,7 @@ def get_drive_service():
         client_id=os.environ["GOOGLE_OAUTH_CLIENT_ID"],
         client_secret=os.environ["GOOGLE_OAUTH_CLIENT_SECRET"],
         token_uri="https://oauth2.googleapis.com/token",
-        scopes=["https://www.googleapis.com/auth/drive.readonly"],
+        scopes=["https://www.googleapis.com/auth/drive.file"],
     )
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
@@ -222,3 +222,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+            
