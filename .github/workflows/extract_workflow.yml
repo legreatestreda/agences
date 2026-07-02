@@ -5,6 +5,10 @@ on:
   schedule:
     - cron: '0 */6 * * *'   # toutes les 6h
 
+permissions:
+  contents: write
+  actions: write
+
 concurrency:
   group: extraction-agences
   cancel-in-progress: false  # le suivant attend, ne coupe pas
@@ -29,7 +33,9 @@ jobs:
         run: pip install beautifulsoup4 requests
 
       - name: Download next 40 ZIPs from Google Drive
+        id: download
         env:
+          PYTHONUNBUFFERED: "1"
           GOOGLE_OAUTH_CLIENT_ID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
           GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
           GOOGLE_OAUTH_REFRESH_TOKEN: ${{ secrets.GOOGLE_OAUTH_REFRESH_TOKEN }}
@@ -38,6 +44,7 @@ jobs:
 
       - name: Run extraction and analysis
         env:
+          PYTHONUNBUFFERED: "1"
           FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
         run: |
           if ls *.zip 1> /dev/null 2>&1; then
@@ -55,3 +62,15 @@ jobs:
           git diff --staged --quiet || git commit -m "extraction: batch $(date +'%Y-%m-%d %H:%M')"
           git pull --rebase --autostash
           git push
+
+      - name: Relancer si des zips restent à traiter
+        if: always() && steps.download.outputs.restants_apres != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          restant="${{ steps.download.outputs.restants_apres }}"
+          echo "Zips restants après ce batch : $restant"
+          if [ "$restant" -gt 0 ]; then
+            gh workflow run extract_workflow.yml --ref main
+          fi
+          
