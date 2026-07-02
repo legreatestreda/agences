@@ -70,8 +70,9 @@ def lister_zips(token):
 def telecharger_zip(token, file_id) -> bytes:
     headers = {"Authorization": f"Bearer {token}"}
     resp = requests.get(
-        f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media",
-        headers=headers, stream=True
+        f"https://www.googleapis.com/drive/v3/files/{file_id}",
+        headers=headers, stream=True,
+        params={"alt": "media", "acknowledgeAbuse": "true"}
     )
     if resp.status_code != 200:
         raise RuntimeError(f"HTTP {resp.status_code} — {resp.text[:200]}")
