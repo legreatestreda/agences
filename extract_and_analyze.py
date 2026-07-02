@@ -104,6 +104,19 @@ def clean_html(html: str) -> str:
 
 # ─── LLM ──────────────────────────────────────────────────────────────────────
 
+import re
+
+def _extraire_json(raw: str) -> str:
+    """Nettoie la sortie du modèle avant parsing : retire le raisonnement
+    éventuel (<think>...</think>) et les fences markdown ```json ... ```."""
+    texte = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+    texte = re.sub(r"^```(?:json)?\s*|\s*```$", "", texte, flags=re.MULTILINE).strip()
+    if not texte.startswith("{"):
+        debut, fin = texte.find("{"), texte.rfind("}")
+        if debut != -1 and fin != -1:
+            texte = texte[debut:fin + 1]
+    return texte
+
 def analyser(texte: str, max_tentatives: int = 3) -> dict:
     vide = {"email": "", "nom_gerant": "", "nb_annonces": "", "taille_equipe": "", "crm_detecte": ""}
 
@@ -120,8 +133,9 @@ def analyser(texte: str, max_tentatives: int = 3) -> dict:
                 ],
                 "response_format": {"type": "json_object"},
                 "temperature": 0,
-                "max_tokens": 200,
-            }, timeout=30)
+                "max_tokens": 300,
+                "thinking": {"type": "disabled"},
+            }, timeout=45)
             resp.raise_for_status()
 
             raw = resp.json()["choices"][0]["message"]["content"].strip()
@@ -133,13 +147,16 @@ def analyser(texte: str, max_tentatives: int = 3) -> dict:
                     continue
                 return {**vide, "_erreur": "réponse vide après plusieurs tentatives"}
 
-            return {**vide, **json.loads(raw)}
+            nettoye = _extraire_json(raw)
+            try:
+                return {**vide, **json.loads(nettoye)}
+            except json.JSONDecodeError:
+                if tentative < max_tentatives:
+                    time.sleep(3 * tentative)
+                    continue
+                print(f"\n   [debug JSON invalide] brut={raw[:300]!r}")
+                return {**vide, "_erreur": f"JSON invalide après {max_tentatives} tentatives"}
 
-        except json.JSONDecodeError:
-            if tentative < max_tentatives:
-                time.sleep(3 * tentative)
-                continue
-            return {**vide, "_erreur": f"JSON invalide après {max_tentatives} tentatives"}
         except Exception as e:
             return {**vide, "_erreur": str(e)}
 
@@ -252,3 +269,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+            
