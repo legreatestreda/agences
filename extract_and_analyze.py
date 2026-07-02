@@ -28,6 +28,7 @@ SLUGS_PRIORITAIRES = [
     "contact", "contactez", "mentions", "equipe", "notre-equipe",
     "notre-agence", "agence", "a-propos", "qui-sommes", "apropos",
     "responsable", "direction", "directeur", "gerant",
+    "agents", "agent", "collaborateurs", "membres", "cabinet",
 ]
 
 def slug_priorite(nom_fichier: str) -> int:
@@ -41,18 +42,38 @@ def slug_priorite(nom_fichier: str) -> int:
 SYSTEM_PROMPT = """Tu es un extracteur de données pour des agences immobilières françaises.
 À partir du texte d'un site web, extrais ces informations en JSON uniquement, sans texte autour :
 {
+  "nom_agence": "nom commercial de l'agence ou vide",
   "email": "adresse email NOMINATIVE ou vide",
-  "nom_gerant": "nom du gérant/directeur/responsable ou vide",
+  "nom_gerant": "nom d'une personne responsable ou vide",
   "nb_annonces": "nombre d'annonces/biens (chiffre uniquement) ou vide",
   "taille_equipe": "nombre de personnes dans l'équipe (chiffre uniquement) ou vide",
   "crm_detecte": "logiciel CRM détecté (Apimo, Netty, etc.) ou vide"
 }
 
+Règle "nom_agence" :
+- Cherche le nom commercial dans le titre de page, l'en-tête, le logo (texte alt), le pied de page,
+  ou les mentions légales (raison sociale). Prends la forme la plus courte et lisible (pas la raison
+  sociale juridique complète type "SARL Dupont Immobilier au capital de...").
+
+Règle "nom_gerant" — IMPORTANT, ne pas se limiter au mot "gérant" :
+- Cherche une personne associée à un rôle de responsabilité : gérant, directeur, directrice,
+  fondateur, fondatrice, responsable, associé, associée, agent principal, négociateur en charge,
+  ou toute personne présentée en premier / mise en avant sur une page équipe.
+- Si la page équipe liste plusieurs noms SANS titre explicite, et qu'il n'y a qu'1 à 3 personnes
+  dans l'équipe (agence solo/duo), prends le premier nom listé — c'est presque toujours le gérant
+  dans une petite structure.
+- Si un email nominatif a été trouvé, vérifie si un nom de la page correspond à cet email
+  (ex: email "j.martin@..." → cherche "Julien Martin" dans le texte) et utilise ce nom.
+- Ne laisse "nom_gerant" vide QUE si aucun nom de personne n'apparaît nulle part dans le texte fourni.
+
 Règle stricte sur "email" :
 - Ne renvoie QUE une adresse nominative, du type prenom.nom@domaine, p.nom@domaine, prenom@domaine.
 - Si l'adresse trouvée est générique (contact@, info@, contactez@, agence@, hello@, bonjour@, accueil@, direction@ sans nom associé, etc.), laisse "email": "".
 - Si plusieurs adresses nominatives existent, choisis celle qui correspond à "nom_gerant" si possible, sinon la première.
-Si une info est absente, laisse "". Ne devine pas."""
+
+Avant de renvoyer une valeur vide pour "nom_gerant" ou "email", relis une seconde fois le texte fourni :
+ces informations sont souvent présentes mais dispersées (ex: nom en haut de la page équipe, email
+en bas de page ou dans une fiche contact séparée). Ne devine jamais une valeur qui n'est pas dans le texte."""
 
 GENERIQUES = {
     "contact", "contactez", "contactez-nous", "info", "infos", "agence",
@@ -118,7 +139,7 @@ def _extraire_json(raw: str) -> str:
     return texte
 
 def analyser(texte: str, max_tentatives: int = 3) -> dict:
-    vide = {"email": "", "nom_gerant": "", "nb_annonces": "", "taille_equipe": "", "crm_detecte": ""}
+    vide = {"nom_agence": "", "email": "", "nom_gerant": "", "nb_annonces": "", "taille_equipe": "", "crm_detecte": ""}
 
     for tentative in range(1, max_tentatives + 1):
         try:
@@ -199,7 +220,9 @@ def main():
         sites: dict[str, list[tuple[int, str]]] = {}
         try:
             with zipfile.ZipFile(zip_path, "r") as z:
-                for info in z.infolist():
+                membres = z.infolist()
+                nb_lus = 0
+                for info in membres:
                     if info.filename.endswith(".html") and not info.filename.startswith("__MACOSX"):
                         priorite = slug_priorite(info.filename)
                         if priorite == len(SLUGS_PRIORITAIRES):
@@ -209,6 +232,9 @@ def main():
                         html    = z.read(info.filename).decode("utf-8", errors="ignore")
                         texte   = clean_html(html)
                         sites.setdefault(site_id, []).append((priorite, texte))
+                    nb_lus += 1
+                    if nb_lus % 200 == 0:
+                        print(f"   … lecture en cours : {nb_lus}/{len(membres)} fichiers", flush=True)
             print(f"   → {len(sites)} sites détectés dans ce zip (pages prioritaires uniquement)")
         except Exception as e:
             print(f"   ❌ Erreur lecture zip : {e}")
@@ -227,6 +253,7 @@ def main():
             resultats.append({
                 "zip":           nom_zip,
                 "site":          site_id,
+                "nom_agence":    infos.get("nom_agence", ""),
                 "email":         infos.get("email", ""),
                 "nom_gerant":    infos.get("nom_gerant", ""),
                 "nb_annonces":   infos.get("nb_annonces", ""),
@@ -239,9 +266,10 @@ def main():
                 nb_erreurs += 1
                 zip_err    += 1
             else:
+                agence = infos.get("nom_agence") or "-"
                 email  = infos.get("email")    or "-"
                 gerant = infos.get("nom_gerant") or "-"
-                print(f"✅ email={email}  gérant={gerant}  ({duree:.1f}s)")
+                print(f"✅ agence={agence}  email={email}  gérant={gerant}  ({duree:.1f}s)")
                 zip_ok += 1
                 if infos.get("email"):    nb_emails  += 1
                 if infos.get("nom_gerant"): nb_gerants += 1
@@ -269,4 +297,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-            
+    
