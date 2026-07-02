@@ -48,7 +48,7 @@ def lister_zips(token):
 
         resp = requests.get(
             "https://www.googleapis.com/drive/v3/files",
-            headers=headers, params=params
+            headers=headers, params=params, timeout=30
         )
         data = resp.json()
         resultats.extend(data.get("files", []))
@@ -73,9 +73,15 @@ def main():
 
     restants = [f for f in tous if f["name"] not in traites]
     batch    = restants[:BATCH_SIZE]
+    apres_ce_batch = len(restants) - len(batch)
 
     print(f"📦 Drive : {len(tous)} zips total | {len(traites)} traités | {len(restants)} restants")
     print(f"   → Téléchargement du prochain batch : {len(batch)} zips\n")
+
+    github_output = os.getenv("GITHUB_OUTPUT")
+    if github_output:
+        with open(github_output, "a", encoding="utf-8") as f:
+            f.write(f"restants_apres={apres_ce_batch}\n")
 
     if not batch:
         print("✅ Tous les zips ont été traités. Rien à télécharger.")
@@ -89,6 +95,7 @@ def main():
             headers=headers,
             params={"alt": "media", "acknowledgeAbuse": "true"},
             stream=True,
+            timeout=60,
         )
         if resp.status_code != 200:
             print(f"❌ HTTP {resp.status_code} — {resp.text[:150]}")
@@ -103,3 +110,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
