@@ -6,7 +6,7 @@ on:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 340
 
     steps:
       - name: Checkout repo
@@ -35,7 +35,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add scan_pages.csv scan_slugs.csv || true
+          git add scan_pages.csv scan_slugs.csv scan_progress.json || true
           git diff --staged --quiet || git commit -m "scan: pages HTML $(date +'%Y-%m-%d %H:%M')"
           git pull --rebase --autostash
           git push
