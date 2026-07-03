@@ -16,9 +16,41 @@ from bs4 import BeautifulSoup
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 
-API_KEY       = os.getenv("FIREWORKS_API_KEY")
-MODEL         = "accounts/fireworks/models/deepseek-v4-flash"
-BASE_URL      = "https://api.fireworks.ai/inference/v1/chat/completions"
+# Chaîne de fallback : on essaie Gemini d'abord (le plus généreux en volume),
+# puis Groq si Gemini est à sec / en erreur, puis Cerebras en dernier recours.
+# Les 3 exposent une API compatible OpenAI, donc même format de payload partout.
+PROVIDERS = [
+    {
+        "nom":           "gemini",
+        "base_url":      "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        "api_key":       os.getenv("GEMINI_API_KEY"),
+        "model":         os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+        "intervalle_s":  4.5,   # ~13 req/min, marge sous les limites publiées
+    },
+    {
+        "nom":           "groq",
+        "base_url":      "https://api.groq.com/openai/v1/chat/completions",
+        "api_key":       os.getenv("GROQ_API_KEY"),
+        "model":         os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"),
+        "intervalle_s":  2.2,   # ~27 req/min, marge sous les 30 RPM publiés
+    },
+    {
+        "nom":           "cerebras",
+        "base_url":      "https://api.cerebras.ai/v1/chat/completions",
+        "api_key":       os.getenv("CEREBRAS_API_KEY"),
+        "model":         os.getenv("CEREBRAS_MODEL", "gpt-oss-120b"),
+        "intervalle_s":  12.0,  # limites RPM basses et instables sur ce provider, on reste prudent
+    },
+]
+
+# horodatage du dernier appel réussi par provider, pour respecter intervalle_s
+_dernier_appel = {p["nom"]: 0.0 for p in PROVIDERS}
+
+# index du provider actuellement utilisé — avance définitivement au suivant
+# dès qu'un provider est à sec, pour ne pas re-tester un provider épuisé
+# à chaque site (perte de temps).
+_provider_idx = 0
+
 PROGRESS_FILE = "progress.json"
 OUTPUT_FILE   = "extraction_results.json"
 MAX_CHARS     = 30000
@@ -138,35 +170,76 @@ def _extraire_json(raw: str) -> str:
             texte = texte[debut:fin + 1]
     return texte
 
+def _appel_provider(provider: dict, texte: str) -> tuple[str | None, int | None, str | None]:
+    """Un seul appel à un provider donné.
+    Retourne (contenu_brut, status_code, erreur_reseau)."""
+    attente = provider["intervalle_s"] - (time.time() - _dernier_appel[provider["nom"]])
+    if attente > 0:
+        time.sleep(attente)
+    _dernier_appel[provider["nom"]] = time.time()
+
+    try:
+        resp = requests.post(provider["base_url"], headers={
+            "Authorization": f"Bearer {provider['api_key']}",
+            "Content-Type": "application/json",
+        }, json={
+            "model": provider["model"],
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user",   "content": f"Voici le texte du site :\n\n{texte[:MAX_CHARS]}"},
+            ],
+            "response_format": {"type": "json_object"},
+            "temperature": 0,
+            "max_tokens": 300,
+        }, timeout=45)
+    except Exception as e:
+        return None, None, str(e)
+
+    if resp.status_code != 200:
+        return None, resp.status_code, resp.text[:200]
+
+    try:
+        contenu = resp.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        return None, resp.status_code, f"réponse inattendue : {e}"
+
+    return contenu, resp.status_code, None
+
 def analyser(texte: str, max_tentatives: int = 3) -> dict:
+    global _provider_idx
     vide = {"nom_agence": "", "email": "", "nom_gerant": "", "nb_annonces": "", "taille_equipe": "", "crm_detecte": ""}
 
-    for tentative in range(1, max_tentatives + 1):
-        try:
-            resp = requests.post(BASE_URL, headers={
-                "Authorization": f"Bearer {API_KEY}",
-                "Content-Type": "application/json",
-            }, json={
-                "model": MODEL,
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user",   "content": f"Voici le texte du site :\n\n{texte[:MAX_CHARS]}"},
-                ],
-                "response_format": {"type": "json_object"},
-                "temperature": 0,
-                "max_tokens": 300,
-                "thinking": {"type": "disabled"},
-            }, timeout=45)
-            resp.raise_for_status()
+    while _provider_idx < len(PROVIDERS):
+        provider = PROVIDERS[_provider_idx]
 
-            raw = resp.json()["choices"][0]["message"]["content"].strip()
+        if not provider["api_key"]:
+            print(f"\n   [{provider['nom']}] pas de clé API configurée, on passe au suivant")
+            _provider_idx += 1
+            continue
 
-            if not raw:
-                # réponse vide = probablement rate limit passager
+        for tentative in range(1, max_tentatives + 1):
+            raw, status, err = _appel_provider(provider, texte)
+
+            # quota épuisé / accès refusé → provider définitivement grillé, on avance
+            if status in (429, 402, 403):
+                print(f"\n   ⚠️  [{provider['nom']}] {status} — bascule vers le provider suivant")
+                _provider_idx += 1
+                break
+
+            # erreur réseau ou HTTP transitoire → on retente ce même provider
+            if raw is None:
                 if tentative < max_tentatives:
                     time.sleep(3 * tentative)
                     continue
-                return {**vide, "_erreur": "réponse vide après plusieurs tentatives"}
+                print(f"\n   ⚠️  [{provider['nom']}] échec après {max_tentatives} tentatives : {err}")
+                _provider_idx += 1
+                break
+
+            if not raw:
+                if tentative < max_tentatives:
+                    time.sleep(3 * tentative)
+                    continue
+                return {**vide, "_erreur": f"[{provider['nom']}] réponse vide après plusieurs tentatives"}
 
             nettoye = _extraire_json(raw)
             try:
@@ -175,13 +248,13 @@ def analyser(texte: str, max_tentatives: int = 3) -> dict:
                 if tentative < max_tentatives:
                     time.sleep(3 * tentative)
                     continue
-                print(f"\n   [debug JSON invalide] brut={raw[:300]!r}")
-                return {**vide, "_erreur": f"JSON invalide après {max_tentatives} tentatives"}
+                print(f"\n   [debug JSON invalide — {provider['nom']}] brut={raw[:300]!r}")
+                return {**vide, "_erreur": f"[{provider['nom']}] JSON invalide après {max_tentatives} tentatives"}
+        else:
+            # la boucle for s'est terminée sans break → sortie normale, rien à faire ici
+            pass
 
-        except Exception as e:
-            return {**vide, "_erreur": str(e)}
-
-    return {**vide, "_erreur": "échec après toutes les tentatives"}
+    return {**vide, "_erreur": "tous les providers sont épuisés ou en échec"}
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 
@@ -198,6 +271,8 @@ def main():
     print(f"   Zips locaux     : {len(zips_locaux)}")
     print(f"   Déjà traités    : {len(traites)}")
     print(f"   À traiter       : {len(zips_a_traiter)}")
+    providers_dispo = [p["nom"] for p in PROVIDERS if p["api_key"]]
+    print(f"   Providers dispo : {', '.join(providers_dispo) or 'AUCUN — vérifie les secrets GitHub'}")
     print(f"   Résultats existants : {len(resultats)}")
     print("=" * 60)
 
@@ -297,4 +372,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
+        
