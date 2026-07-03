@@ -21,25 +21,29 @@ from bs4 import BeautifulSoup
 # Les 3 exposent une API compatible OpenAI, donc même format de payload partout.
 PROVIDERS = [
     {
-        "nom":           "gemini",
-        "base_url":      "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-        "api_key":       os.getenv("GEMINI_API_KEY"),
-        "model":         os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
-        "intervalle_s":  4.5,   # ~13 req/min, marge sous les limites publiées
+        "nom":              "gemini",
+        "base_url":         "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        "api_key":          os.getenv("GEMINI_API_KEY"),
+        "model":            os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+        "intervalle_s":     4.5,   # ~13 req/min, marge sous les limites publiées
+        "reasoning_effort": "none",   # coupe le thinking budget de Gemini 2.5
+        "extra_params": {"google": {"thinking_config": {"thinking_budget": 0}}},
     },
     {
-        "nom":           "groq",
-        "base_url":      "https://api.groq.com/openai/v1/chat/completions",
-        "api_key":       os.getenv("GROQ_API_KEY"),
-        "model":         os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"),
-        "intervalle_s":  2.2,   # ~27 req/min, marge sous les 30 RPM publiés
+        "nom":              "groq",
+        "base_url":         "https://api.groq.com/openai/v1/chat/completions",
+        "api_key":          os.getenv("GROQ_API_KEY"),
+        "model":            os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"),
+        "intervalle_s":     2.2,   # ~27 req/min, marge sous les 30 RPM publiés
+        "reasoning_effort": "low",    # gpt-oss exige un minimum de reasoning, on le réduit au max
     },
     {
-        "nom":           "cerebras",
-        "base_url":      "https://api.cerebras.ai/v1/chat/completions",
-        "api_key":       os.getenv("CEREBRAS_API_KEY"),
-        "model":         os.getenv("CEREBRAS_MODEL", "gpt-oss-120b"),
-        "intervalle_s":  12.0,  # limites RPM basses et instables sur ce provider, on reste prudent
+        "nom":              "cerebras",
+        "base_url":         "https://api.cerebras.ai/v1/chat/completions",
+        "api_key":          os.getenv("CEREBRAS_API_KEY"),
+        "model":            os.getenv("CEREBRAS_MODEL", "gpt-oss-120b"),
+        "intervalle_s":     12.0,  # limites RPM basses et instables sur ce provider, on reste prudent
+        "reasoning_effort": "low",
     },
 ]
 
@@ -190,8 +194,10 @@ def _appel_provider(provider: dict, texte: str) -> tuple[str | None, int | None,
             ],
             "response_format": {"type": "json_object"},
             "temperature": 0,
-            "max_tokens": 300,
-        }, timeout=45)
+            "max_tokens": 2000,
+            "reasoning_effort": provider.get("reasoning_effort", "low"),
+            **provider.get("extra_params", {}),
+        }, timeout=60)
     except Exception as e:
         return None, None, str(e)
 
@@ -199,10 +205,11 @@ def _appel_provider(provider: dict, texte: str) -> tuple[str | None, int | None,
         return None, resp.status_code, resp.text[:200]
 
     try:
-        contenu = resp.json()["choices"][0]["message"]["content"].strip()
+        message = resp.json()["choices"][0]["message"]
     except Exception as e:
         return None, resp.status_code, f"réponse inattendue : {e}"
 
+    contenu = (message.get("content") or "").strip()
     return contenu, resp.status_code, None
 
 def analyser(texte: str, max_tentatives: int = 3) -> dict:
@@ -372,4 +379,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-        
