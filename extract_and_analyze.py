@@ -16,19 +16,12 @@ from bs4 import BeautifulSoup
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 
-# Chaîne de fallback : on essaie Gemini d'abord (le plus généreux en volume),
-# puis Groq si Gemini est à sec / en erreur, puis Cerebras en dernier recours.
-# Les 3 exposent une API compatible OpenAI, donc même format de payload partout.
+# Chaîne de fallback : Gemini retiré (250 req/jour gratuit, trop faible pour
+# notre volume — il était épuisé en quelques minutes). On combine seulement
+# Groq (rapide, 1000 RPD / 200K TPD sur gpt-oss-120b) et Cerebras (1M
+# tokens/jour, le plus gros volume journalier des deux).
+# Les 2 exposent une API compatible OpenAI, donc même format de payload partout.
 PROVIDERS = [
-    {
-        "nom":              "gemini",
-        "base_url":         "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-        "api_key":          os.getenv("GEMINI_API_KEY"),
-        "model":            os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
-        "intervalle_s":     4.5,   # ~13 req/min, marge sous les limites publiées
-        "reasoning_effort": "none",   # coupe le thinking budget de Gemini 2.5
-        "extra_params": {"google": {"thinking_config": {"thinking_budget": 0}}},
-    },
     {
         "nom":              "groq",
         "base_url":         "https://api.groq.com/openai/v1/chat/completions",
@@ -42,7 +35,7 @@ PROVIDERS = [
         "base_url":         "https://api.cerebras.ai/v1/chat/completions",
         "api_key":          os.getenv("CEREBRAS_API_KEY"),
         "model":            os.getenv("CEREBRAS_MODEL", "gpt-oss-120b"),
-        "intervalle_s":     12.0,  # limites RPM basses et instables sur ce provider, on reste prudent
+        "intervalle_s":     12.0,  # ~5 req/min, aligné sur la vraie limite officielle (5 RPM / 30K TPM / 1M TPD)
         "reasoning_effort": "low",
     },
 ]
@@ -130,14 +123,21 @@ def est_nominatif(email: str) -> bool:
 # ─── PROGRESS ─────────────────────────────────────────────────────────────────
 
 def charger_progress():
+    """Retourne (zips_traites, sites_traites) — sites_traites permet de
+    reprendre EN PLEIN MILIEU d'un zip sans retraiter (et dupliquer) les
+    sites déjà analysés avant un arrêt pour quota épuisé."""
     if os.path.exists(PROGRESS_FILE):
         with open(PROGRESS_FILE, encoding="utf-8") as f:
-            return set(json.load(f).get("traites", []))
-    return set()
+            data = json.load(f)
+            return set(data.get("traites", [])), set(data.get("sites_traites", []))
+    return set(), set()
 
-def sauver_progress(traites: set):
+def sauver_progress(traites: set, sites_traites: set):
     with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
-        json.dump({"traites": list(traites)}, f, ensure_ascii=False)
+        json.dump({
+            "traites": list(traites),
+            "sites_traites": list(sites_traites),
+        }, f, ensure_ascii=False)
 
 # ─── RÉSULTATS ────────────────────────────────────────────────────────────────
 
@@ -212,6 +212,11 @@ def _appel_provider(provider: dict, texte: str) -> tuple[str | None, int | None,
     contenu = (message.get("content") or "").strip()
     return contenu, resp.status_code, None
 
+def tous_epuises() -> bool:
+    """True si on a avancé au-delà du dernier provider disponible —
+    plus aucun quota gratuit à utiliser aujourd'hui."""
+    return _provider_idx >= len(PROVIDERS)
+
 def analyser(texte: str, max_tentatives: int = 3) -> dict:
     global _provider_idx
     vide = {"nom_agence": "", "email": "", "nom_gerant": "", "nb_annonces": "", "taille_equipe": "", "crm_detecte": ""}
@@ -267,7 +272,7 @@ def analyser(texte: str, max_tentatives: int = 3) -> dict:
 
 def main():
     debut_global = time.time()
-    traites   = charger_progress()
+    traites, sites_traites = charger_progress()
     resultats = charger_resultats()
 
     zips_locaux    = sorted(glob.glob("*.zip"))
@@ -291,8 +296,12 @@ def main():
     nb_erreurs    = 0
     nb_emails     = 0
     nb_gerants    = 0
+    stop_quota    = False   # True dès que tous les providers sont à sec
 
     for i, zip_path in enumerate(zips_a_traiter, 1):
+        if stop_quota:
+            break
+
         nom_zip    = os.path.basename(zip_path)
         debut_zip  = time.time()
         print(f"\n{'─'*60}")
@@ -323,7 +332,23 @@ def main():
             continue
 
         zip_ok = zip_err = 0
+        zip_complet = True   # passe à False si on doit stopper en plein milieu
+
         for site_id, pages in sites.items():
+            cle_site = f"{nom_zip}::{site_id}"
+            if cle_site in sites_traites:
+                continue  # déjà traité lors d'un run précédent (repris après arrêt quota)
+
+            # ── Vérif AVANT l'appel : si plus aucun provider dispo, on arrête
+            # immédiatement (pas de nouvel appel API, pas d'erreur inutile) ──
+            if tous_epuises():
+                print(f"\n   ⏸️  Quota épuisé sur tous les providers — arrêt immédiat.")
+                print(f"      Reprise automatique dès que le quota journalier reset")
+                print(f"      (le prochain run planifié retombera pile sur ce zip).")
+                zip_complet = False
+                stop_quota  = True
+                break
+
             nb_sites += 1
             debut_site = time.time()
             print(f"   [{nb_sites}] {site_id[:45]}", end=" ... ", flush=True)
@@ -342,11 +367,14 @@ def main():
                 "taille_equipe": infos.get("taille_equipe", ""),
                 "crm_detecte":   infos.get("crm_detecte", ""),
             })
+            sites_traites.add(cle_site)
 
             if infos.get("_erreur"):
                 print(f"⚠️  {infos['_erreur']} ({duree:.1f}s)")
                 nb_erreurs += 1
                 zip_err    += 1
+                # si l'erreur vient d'un épuisement total juste détecté par analyser(),
+                # on s'arrête aussi net à la prochaine itération (tous_epuises() le verra)
             else:
                 agence = infos.get("nom_agence") or "-"
                 email  = infos.get("email")    or "-"
@@ -356,19 +384,33 @@ def main():
                 if infos.get("email"):    nb_emails  += 1
                 if infos.get("nom_gerant"): nb_gerants += 1
 
-        duree_zip = time.time() - debut_zip
-        print(f"   ✔ Zip terminé en {duree_zip:.0f}s — {zip_ok} OK | {zip_err} erreurs")
+            # sauvegarde incrémentale : si le process est coupé (timeout, kill),
+            # on ne reperd jamais plus qu'un seul site
+            sauver_progress(traites, sites_traites)
+            sauver_resultats(resultats)
 
-        traites.add(nom_zip)
-        sauver_progress(traites)
-        sauver_resultats(resultats)
-        os.remove(zip_path)
+        duree_zip = time.time() - debut_zip
+
+        if zip_complet:
+            print(f"   ✔ Zip terminé en {duree_zip:.0f}s — {zip_ok} OK | {zip_err} erreurs")
+            traites.add(nom_zip)
+            # le zip est fini : plus besoin de garder le détail par site pour lui
+            sites_traites = {c for c in sites_traites if not c.startswith(f"{nom_zip}::")}
+            sauver_progress(traites, sites_traites)
+            sauver_resultats(resultats)
+            os.remove(zip_path)
+        else:
+            print(f"   ⏸️  Zip interrompu après {duree_zip:.0f}s — {zip_ok} OK | {zip_err} erreurs "
+                  f"({len(sites) - zip_ok - zip_err} sites restants, repris au prochain run)")
+            # zip PAS marqué comme traité, PAS supprimé → repris tel quel plus tard
 
     duree_totale = time.time() - debut_global
     print(f"\n{'='*60}")
-    print(f"✅ EXTRACTION TERMINÉE")
+    if stop_quota:
+        print(f"⏸️  EXTRACTION SUSPENDUE (quota épuisé) — reprise au prochain cycle planifié")
+    else:
+        print(f"✅ EXTRACTION TERMINÉE")
     print(f"   Durée totale    : {duree_totale/60:.1f} min")
-    print(f"   Zips traités    : {len(zips_a_traiter)}")
     print(f"   Sites traités   : {nb_sites}")
     print(f"   Emails trouvés  : {nb_emails} ({nb_emails/nb_sites*100:.0f}%)" if nb_sites else "   Sites traités   : 0")
     print(f"   Gérants trouvés : {nb_gerants} ({nb_gerants/nb_sites*100:.0f}%)" if nb_sites else "")
@@ -379,3 +421,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+        
